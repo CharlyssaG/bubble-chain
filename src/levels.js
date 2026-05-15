@@ -2,7 +2,7 @@
 //  LEVEL GENERATION — 1000 levels, boss every 10th
 // ═══════════════════════════════════════════════════════════
 
-import { realmForLevel, isBossLevel, bossName } from "./realms.js";
+import { realmForLevel, isBossLevel, bossName, REALMS } from "./realms.js";
 
 export const TYPE_INFO = [
   { type: "normal",     name: "NORMAL",     desc: "Standard. Pops, expands, chains.",                          intro: 1   },
@@ -206,3 +206,122 @@ function genLevelName(n, realm) {
 
 // Pre-generate all 1000 levels
 export const ALL_LEVELS = Array.from({ length: 1000 }, (_, i) => generateLevel(i + 1));
+
+// ═══════════════════════════════════════════════════════════
+//  NEW GAME PLUS — same levels, cranked difficulty
+// ═══════════════════════════════════════════════════════════
+function toughenLevel(lvl) {
+  // Clone and modify
+  const ng = { ...lvl, mix: { ...lvl.mix } };
+
+  // Hold time cut by ~30%, floor at 9 frames
+  ng.hold = Math.max(9, Math.round(lvl.hold * 0.7));
+
+  // Pass threshold up to 75%
+  ng.passPercent = Math.min(0.85, lvl.passPercent + 0.15);
+  ng.passThreshold = Math.ceil(ng.total * ng.passPercent);
+
+  // Faster fast bubbles
+  ng.fastMul = Math.min(12, lvl.fastMul * 1.3);
+
+  // Shift some normals into chaos types (fast, teleporter, bomb)
+  // — only if those types are unlocked at this level
+  const unlocked = TYPE_INFO.filter(t => t.intro <= lvl.n).map(t => t.type);
+  const chaosTypes = ["fast", "teleporter", "bomb"].filter(t => unlocked.includes(t));
+
+  if (chaosTypes.length > 0 && ng.mix.normal > 5) {
+    const convert = Math.floor(ng.mix.normal * 0.3);
+    ng.mix.normal -= convert;
+    const each = Math.floor(convert / chaosTypes.length);
+    let leftover = convert - each * chaosTypes.length;
+    for (const t of chaosTypes) {
+      ng.mix[t] = (ng.mix[t] || 0) + each;
+    }
+    // Dump leftover into the first chaos type
+    if (leftover > 0) ng.mix[chaosTypes[0]] += leftover;
+  }
+
+  return ng;
+}
+
+export const ALL_LEVELS_NGPLUS = ALL_LEVELS.map(toughenLevel);
+
+export function getLevel(lvlIdx, ngPlus = false) {
+  const arr = ngPlus ? ALL_LEVELS_NGPLUS : ALL_LEVELS;
+  return arr[Math.min(lvlIdx, arr.length - 1)];
+}
+
+// ═══════════════════════════════════════════════════════════
+//  ENDLESS MODE — procedurally generated waves
+// ═══════════════════════════════════════════════════════════
+// Each "wave" is a fresh random level that scales harder than the last.
+// Wave 1 starts at roughly level 800 difficulty, then keeps climbing.
+export function generateEndlessWave(waveNum) {
+  // Pick a random realm — cycles through with each batch of 10 waves
+  const realmIdx = Math.floor((waveNum - 1) / 10) % REALMS.length;
+  const realm = { ...REALMS[realmIdx], index: realmIdx };
+
+  // Difficulty scaling
+  // Start near level 800 difficulty, then climb to harder than level 1000 quickly.
+  const equivalent = 800 + waveNum * 4;
+
+  const total = Math.min(120, Math.round(45 + waveNum * 0.6));
+  const hold = Math.max(8, Math.round(20 - waveNum * 0.05));
+  const expansion = Math.max(42, Math.round(60 - waveNum * 0.06));
+  const fastMul = Math.min(14, 7 + waveNum * 0.02);
+  const passPercent = Math.min(0.8, 0.55 + waveNum * 0.001);
+
+  // All types unlocked in endless
+  const allTypes = TYPE_INFO.map(t => t.type);
+
+  // Random themed mix per wave
+  const mix = {};
+  let remaining = total;
+  // Normals: 20-35%
+  mix.normal = Math.max(5, Math.round(total * (0.20 + Math.random() * 0.15)));
+  remaining -= mix.normal;
+
+  // Pick 3-5 "featured" types this wave for variety
+  const numFeatured = 3 + Math.floor(Math.random() * 3);
+  const specials = allTypes.filter(t => t !== "normal").sort(() => Math.random() - 0.5);
+  const featured = specials.slice(0, numFeatured);
+  const others = specials.slice(numFeatured);
+
+  // Heavy share to featured
+  for (const t of featured) {
+    if (remaining <= 0) break;
+    const share = Math.max(2, Math.floor(remaining * (0.5 / numFeatured)));
+    mix[t] = Math.min(share, remaining);
+    remaining -= mix[t];
+  }
+
+  // Light sprinkle of others
+  for (const t of others) {
+    if (remaining <= 0) break;
+    const share = Math.max(1, Math.floor(remaining * 0.15));
+    mix[t] = Math.min(share, remaining);
+    remaining -= mix[t];
+  }
+  if (remaining > 0) mix.normal += remaining;
+
+  // Boss wave every 10
+  const boss = waveNum % 10 === 0;
+
+  return {
+    n: waveNum,
+    name: boss ? `ENDLESS BOSS ${waveNum}` : `WAVE ${waveNum}`,
+    realm,
+    boss,
+    introType: null,
+    mix,
+    hold,
+    expansion,
+    fastMul,
+    passPercent,
+    total,
+    passThreshold: Math.ceil(total * passPercent),
+    roundStart: waveNum, // not used in endless
+    endless: true,
+    equivalent,
+  };
+}

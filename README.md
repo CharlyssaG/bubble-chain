@@ -1,6 +1,12 @@
 # Chain Reaction
 
-A one-click bubble chain-reaction game. 1000 levels across 10 themed realms, 10 bubble types, 100 bosses. Built with React + Vite.
+A one-click bubble chain-reaction game. 1000 levels across 10 themed realms, 10 bubble types, 100 bosses, ASMR sound design. Built with React + Vite.
+
+## Modes
+
+- **Story** — The journey. 1000 levels, 10 realms, save & resume.
+- **★ New Game +** — Unlocked after first 1000-clear. Same levels, harder: tighter timing, higher pass thresholds, more chaos bubbles. Separate save slot.
+- **∞ Endless** — Unlocked after first 1000-clear. Procedurally scaling waves. One life. No mercy. Track your best wave.
 
 ## The journey
 

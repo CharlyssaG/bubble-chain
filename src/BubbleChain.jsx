@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback } from "react";
-import { ALL_LEVELS, TYPE_INFO } from "./levels.js";
+import { ALL_LEVELS, ALL_LEVELS_NGPLUS, TYPE_INFO, getLevel, generateEndlessWave } from "./levels.js";
 import { REALMS, realmForLevel } from "./realms.js";
 import { playPop, resumeAudio, setAudioEnabled, isAudioEnabled } from "./audio.js";
 
@@ -145,6 +145,22 @@ export default function BubbleChain() {
   const [totalScore, setTotalScore] = useState(0);
   const [best, setBest] = useState(0);
 
+  // Mode: "story" (standard 1000 levels), "ngplus" (harder 1000), "endless" (procedural)
+  const [mode, setMode] = useState("story");
+
+  // Unlocks (granted on completing the standard 1000)
+  const [ngPlusUnlocked, setNgPlusUnlocked] = useState(false);
+  const [endlessUnlocked, setEndlessUnlocked] = useState(false);
+
+  // Mode-specific progress
+  const [ngPlusLevel, setNgPlusLevel] = useState(0); // separate save slot
+  const [endlessWave, setEndlessWave] = useState(1); // current wave
+  const [endlessBest, setEndlessBest] = useState(0); // best wave reached
+  const [endlessTotal, setEndlessTotal] = useState(0); // total score this run
+
+  // Pause/menu screen
+  const [showModeSelect, setShowModeSelect] = useState(false);
+
   const [gameState, setGameState] = useState("ready");
   const [score, setScore] = useState(0);
   const [showTypes, setShowTypes] = useState(false);
@@ -154,7 +170,16 @@ export default function BubbleChain() {
   const [progressLoaded, setProgressLoaded] = useState(false);
   const [audioOn, setAudioOn] = useState(true);
 
-  const levelCfg = ALL_LEVELS[Math.min(level, ALL_LEVELS.length - 1)];
+  // Pick level config based on current mode
+  let levelCfg;
+  if (mode === "endless") {
+    // Generate the current wave on demand
+    levelCfg = generateEndlessWave(endlessWave);
+  } else if (mode === "ngplus") {
+    levelCfg = getLevel(ngPlusLevel, true);
+  } else {
+    levelCfg = getLevel(level, false);
+  }
   const realm = levelCfg.realm;
   const total = levelCfg.total;
   const passThreshold = levelCfg.passThreshold;
@@ -166,7 +191,7 @@ export default function BubbleChain() {
   useEffect(() => {
     levelCfgRef.current = levelCfg;
     paletteRef.current = paletteForRealm(levelCfg.realm);
-  }, [level]); // eslint-disable-line
+  }, [level, ngPlusLevel, endlessWave, mode]); // eslint-disable-line
 
   // ── Load saved progress ──
   useEffect(() => {
@@ -178,6 +203,10 @@ export default function BubbleChain() {
         if (typeof data.totalScore === "number") setTotalScore(data.totalScore);
         if (typeof data.best === "number") setBest(data.best);
         if (typeof data.audioOn === "boolean") setAudioOn(data.audioOn);
+        if (typeof data.ngPlusUnlocked === "boolean") setNgPlusUnlocked(data.ngPlusUnlocked);
+        if (typeof data.endlessUnlocked === "boolean") setEndlessUnlocked(data.endlessUnlocked);
+        if (typeof data.ngPlusLevel === "number") setNgPlusLevel(data.ngPlusLevel);
+        if (typeof data.endlessBest === "number") setEndlessBest(data.endlessBest);
       }
     } catch (e) { /* ignore */ }
     setProgressLoaded(true);
@@ -194,14 +223,16 @@ export default function BubbleChain() {
     try {
       localStorage.setItem(
         "chain_reaction_save",
-        JSON.stringify({ level, totalScore, best, audioOn })
+        JSON.stringify({
+          level, totalScore, best, audioOn,
+          ngPlusUnlocked, endlessUnlocked, ngPlusLevel, endlessBest
+        })
       );
     } catch (e) { /* ignore */ }
-  }, [level, totalScore, best, audioOn, progressLoaded]);
+  }, [level, totalScore, best, audioOn, ngPlusUnlocked, endlessUnlocked, ngPlusLevel, endlessBest, progressLoaded]);
 
-  const resetBubbles = useCallback((lvlIdx) => {
+  const resetBubbles = useCallback((cfg) => {
     const { w, h, scale } = dimsRef.current;
-    const cfg = ALL_LEVELS[Math.min(lvlIdx, ALL_LEVELS.length - 1)];
     bubblesRef.current = buildBubbles(cfg, w, h, scale);
     levelCfgRef.current = cfg;
     paletteRef.current = paletteForRealm(cfg.realm);
@@ -224,7 +255,7 @@ export default function BubbleChain() {
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       const scale = computeScale(rect.width, rect.height);
       dimsRef.current = { w: rect.width, h: rect.height, scale };
-      if (bubblesRef.current.length === 0) resetBubbles(0);
+      if (bubblesRef.current.length === 0) resetBubbles(getLevel(0, false));
     };
     resize();
     window.addEventListener("resize", resize);
@@ -472,39 +503,80 @@ export default function BubbleChain() {
 
   useEffect(() => {
     if (gameState === "done") {
-      setTotalScore(t => t + scoreRef.current);
-      setBest(b => Math.max(b, scoreRef.current));
+      const earned = scoreRef.current;
+      if (mode === "endless") {
+        setEndlessTotal(t => t + earned);
+      } else {
+        setTotalScore(t => t + earned);
+      }
+      setBest(b => Math.max(b, earned));
     }
-  }, [gameState]);
+  }, [gameState]); // eslint-disable-line
+
+  // Unlock NG+ and Endless when player completes story mode (reaches gameover in story)
+  useEffect(() => {
+    if (gameState === "gameover" && mode === "story") {
+      setNgPlusUnlocked(true);
+      setEndlessUnlocked(true);
+    }
+  }, [gameState, mode]);
 
   // ── Level navigation ──
-  const startLevel = (lvlIdx) => {
-    resumeAudio(); // unlock audio on any level start
-    resetBubbles(lvlIdx);
-    setScore(0);
-    setLevel(lvlIdx);
+  // Starts whatever the "current" level is for the current mode.
+  // For story/ngplus: lvlIdx is the level number minus 1.
+  // For endless: lvlIdx is ignored; we use endlessWave.
+  const startLevel = (lvlIdx, modeOverride) => {
+    resumeAudio();
+    const activeMode = modeOverride || mode;
 
+    let cfg;
+    if (activeMode === "endless") {
+      cfg = generateEndlessWave(endlessWave);
+    } else if (activeMode === "ngplus") {
+      cfg = getLevel(lvlIdx, true);
+      setNgPlusLevel(lvlIdx);
+    } else {
+      cfg = getLevel(lvlIdx, false);
+      setLevel(lvlIdx);
+    }
+
+    resetBubbles(cfg);
+    setScore(0);
+
+    if (activeMode === "endless") {
+      // Endless: no intros except boss waves
+      if (cfg.boss) {
+        setShowBossIntro(true);
+        setNewType(null);
+        setShowRealmIntro(false);
+        setGameState("ready");
+      } else {
+        setNewType(null);
+        setShowRealmIntro(false);
+        setShowBossIntro(false);
+        setGameState("playing");
+      }
+      return;
+    }
+
+    // Story / NG+ flow with intros
     const n = lvlIdx + 1;
-    const prevLvl = level;
+    const prevLvl = activeMode === "ngplus" ? ngPlusLevel : level;
     const prevN = prevLvl + 1;
 
-    // Check for realm transition (entered a new realm)
     const newRealm = realmForLevel(n);
     const prevRealm = realmForLevel(prevN);
     const isRealmEntry = n === 1 || (newRealm.id !== prevRealm.id && lvlIdx > prevLvl);
 
-    // Check for new type introduction
     const intro = TYPE_INFO.find(t => t.intro === n);
-
-    // Check for boss
-    const cfg = ALL_LEVELS[lvlIdx];
 
     if (isRealmEntry && lvlIdx > 0) {
       setShowRealmIntro(true);
       setNewType(null);
       setShowBossIntro(false);
       setGameState("ready");
-    } else if (intro && lvlIdx > 0) {
+    } else if (intro && lvlIdx > 0 && activeMode === "story") {
+      // Skip type intros in NG+ since the player already knows them
       setNewType(intro);
       setShowRealmIntro(false);
       setShowBossIntro(false);
@@ -530,25 +602,98 @@ export default function BubbleChain() {
   };
 
   const nextLevel = () => {
-    if (level + 1 >= 1000) {
-      setGameState("gameover");
+    if (mode === "endless") {
+      // Endless: advance to next wave
+      const nextWave = endlessWave + 1;
+      setEndlessWave(nextWave);
+      setEndlessBest(b => Math.max(b, nextWave));
+      // startLevel doesn't read endlessWave directly until next render, so we run it after
+      setTimeout(() => {
+        const cfg = generateEndlessWave(nextWave);
+        resetBubbles(cfg);
+        setScore(0);
+        if (cfg.boss) {
+          setShowBossIntro(true);
+          setGameState("ready");
+        } else {
+          setGameState("playing");
+        }
+      }, 0);
+      return;
+    }
+
+    if (mode === "ngplus") {
+      if (ngPlusLevel + 1 >= 1000) {
+        setGameState("gameover");
+      } else {
+        startLevel(ngPlusLevel + 1);
+      }
     } else {
-      startLevel(level + 1);
+      // Story
+      if (level + 1 >= 1000) {
+        setGameState("gameover");
+      } else {
+        startLevel(level + 1);
+      }
     }
   };
 
-  // Fail: go back to start of current 10-level round
+  // Fail: behavior depends on mode
   const retryRound = () => {
-    const roundStart = levelCfg.roundStart - 1; // to 0-indexed
+    if (mode === "endless") {
+      // Endless: run over, save best, kick back to mode select
+      setEndlessBest(b => Math.max(b, endlessWave - 1));
+      setEndlessWave(1);
+      setEndlessTotal(0);
+      setShowModeSelect(true);
+      setGameState("ready");
+      return;
+    }
+    const roundStart = levelCfg.roundStart - 1; // 0-indexed
     startLevel(roundStart);
   };
 
+  // Retry single level (also handles endless = restart from wave 1)
+  const retrySame = () => {
+    if (mode === "endless") {
+      retryRound();
+      return;
+    }
+    startLevel(mode === "ngplus" ? ngPlusLevel : level);
+  };
+
   const restartGame = () => {
-    if (!confirm("Erase all progress and restart from level 1?")) return;
+    if (!confirm("Erase ALL progress (story, NG+, endless, unlocks)? This cannot be undone.")) return;
     setTotalScore(0);
     setBest(0);
+    setNgPlusUnlocked(false);
+    setEndlessUnlocked(false);
+    setNgPlusLevel(0);
+    setEndlessBest(0);
+    setEndlessWave(1);
+    setMode("story");
     try { localStorage.removeItem("chain_reaction_save"); } catch (e) { /* ignore */ }
-    startLevel(0);
+    setShowModeSelect(false);
+    startLevel(0, "story");
+  };
+
+  // Switch to a mode
+  const enterMode = (newMode) => {
+    setMode(newMode);
+    setShowModeSelect(false);
+    if (newMode === "endless") {
+      setEndlessWave(1);
+      setEndlessTotal(0);
+      // Generate first wave
+      const cfg = generateEndlessWave(1);
+      resetBubbles(cfg);
+      setScore(0);
+      setGameState("playing");
+    } else if (newMode === "ngplus") {
+      startLevel(ngPlusLevel, "ngplus");
+    } else {
+      startLevel(level, "story");
+    }
   };
 
   const typesInLevel = Object.keys(levelCfg.mix);
@@ -573,7 +718,14 @@ export default function BubbleChain() {
       }}>
         <div>
           <div style={{ fontSize: "9px", letterSpacing: "2px", opacity: 0.7, color: realm.accent }}>
-            {realm.name} · LV {String(level + 1).padStart(4, "0")}
+            {mode === "endless" ? (
+              <>∞ ENDLESS · WAVE {endlessWave}</>
+            ) : (
+              <>
+                {mode === "ngplus" && <span style={{ color: realm.secondaryAccent, marginRight: 4 }}>★ NG+</span>}
+                {realm.name} · LV {String((mode === "ngplus" ? ngPlusLevel : level) + 1).padStart(4, "0")}
+              </>
+            )}
             {levelCfg.boss && <span style={{ color: realm.secondaryAccent, marginLeft: 6 }}>⚔ BOSS</span>}
           </div>
           <div style={{ fontSize: "13px", letterSpacing: "3px", opacity: 0.85, marginTop: 2 }}>
@@ -597,32 +749,63 @@ export default function BubbleChain() {
           </div>
         </div>
         <div style={{ textAlign: "right" }}>
-          <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6 }}>PROGRESS</div>
-          <div style={{ fontSize: "16px", fontWeight: "bold" }}>
-            {level + 1}<span style={{ opacity: 0.4 }}>/1000</span>
+          {mode === "endless" ? (
+            <>
+              <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6 }}>WAVE</div>
+              <div style={{ fontSize: "16px", fontWeight: "bold" }}>{endlessWave}</div>
+              <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6, marginTop: 4 }}>BEST WAVE</div>
+              <div style={{ fontSize: "16px", fontWeight: "bold" }}>{endlessBest}</div>
+              <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6, marginTop: 4 }}>RUN TOTAL</div>
+              <div style={{ fontSize: "13px", fontWeight: "bold" }}>{endlessTotal}</div>
+            </>
+          ) : (
+            <>
+              <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6 }}>PROGRESS</div>
+              <div style={{ fontSize: "16px", fontWeight: "bold" }}>
+                {(mode === "ngplus" ? ngPlusLevel : level) + 1}<span style={{ opacity: 0.4 }}>/1000</span>
+              </div>
+              <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6, marginTop: 4 }}>TOTAL</div>
+              <div style={{ fontSize: "16px", fontWeight: "bold" }}>{totalScore}</div>
+              <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6, marginTop: 4 }}>BEST</div>
+              <div style={{ fontSize: "13px", fontWeight: "bold" }}>{best}</div>
+            </>
+          )}
+          <div style={{ display: "flex", gap: 4, marginTop: 8, justifyContent: "flex-end" }}>
+            <button
+              onClick={() => { setShowModeSelect(true); }}
+              style={{
+                background: "transparent",
+                border: `1px solid rgba(${hexToRgb(realm.accent)}, 0.4)`,
+                color: realm.accent,
+                fontSize: "10px",
+                padding: "4px 8px",
+                letterSpacing: "2px",
+                fontFamily: realm.font,
+                cursor: "pointer",
+                pointerEvents: "auto",
+                textShadow: `0 0 6px ${realm.accentGlow}`,
+              }}
+            >
+              ☰
+            </button>
+            <button
+              onClick={() => { resumeAudio(); setAudioOn(a => !a); }}
+              style={{
+                background: "transparent",
+                border: `1px solid rgba(${hexToRgb(realm.accent)}, 0.4)`,
+                color: realm.accent,
+                fontSize: "10px",
+                padding: "4px 8px",
+                letterSpacing: "2px",
+                fontFamily: realm.font,
+                cursor: "pointer",
+                pointerEvents: "auto",
+                textShadow: `0 0 6px ${realm.accentGlow}`,
+              }}
+            >
+              {audioOn ? "♪ ON" : "♪ OFF"}
+            </button>
           </div>
-          <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6, marginTop: 4 }}>TOTAL</div>
-          <div style={{ fontSize: "16px", fontWeight: "bold" }}>{totalScore}</div>
-          <div style={{ fontSize: "8px", letterSpacing: "2px", opacity: 0.6, marginTop: 4 }}>BEST</div>
-          <div style={{ fontSize: "13px", fontWeight: "bold" }}>{best}</div>
-          <button
-            onClick={() => { resumeAudio(); setAudioOn(a => !a); }}
-            style={{
-              marginTop: 8,
-              background: "transparent",
-              border: `1px solid rgba(${hexToRgb(realm.accent)}, 0.4)`,
-              color: realm.accent,
-              fontSize: "10px",
-              padding: "4px 8px",
-              letterSpacing: "2px",
-              fontFamily: realm.font,
-              cursor: "pointer",
-              pointerEvents: "auto",
-              textShadow: `0 0 6px ${realm.accentGlow}`,
-            }}
-          >
-            {audioOn ? "♪ ON" : "♪ OFF"}
-          </button>
         </div>
       </div>
 
@@ -640,10 +823,10 @@ export default function BubbleChain() {
         />
 
         {/* MAIN MENU */}
-        {gameState === "ready" && !newType && !showRealmIntro && !showBossIntro && (
+        {gameState === "ready" && !newType && !showRealmIntro && !showBossIntro && !showModeSelect && (
           <Overlay realm={realm}>
             <div style={{ fontSize: "10px", letterSpacing: "5px", opacity: 0.6, marginBottom: "10px", color: realm.accent }}>
-              ONE CLICK · MAX CHAIN · 1000 LEVELS
+              {mode === "endless" ? "∞ ENDLESS MODE ∞" : mode === "ngplus" ? "★ NEW GAME + ★" : "ONE CLICK · MAX CHAIN · 1000 LEVELS"}
             </div>
             <div style={{
               fontSize: "44px", fontWeight: "bold", letterSpacing: "4px", marginBottom: "10px",
@@ -653,18 +836,74 @@ export default function BubbleChain() {
               CHAIN<br/>REACTION
             </div>
             <div style={{ fontSize: "11px", opacity: 0.6, maxWidth: "320px", textAlign: "center", lineHeight: 1.6, marginBottom: "18px", fontStyle: "italic" }}>
-              A pilot. Ten realms. One impossible journey home.
+              {mode === "endless"
+                ? "Survive as long as you can. One life. No mercy."
+                : mode === "ngplus"
+                ? "The journey, harder. Less time, more chaos, higher stakes."
+                : "A pilot. Ten realms. One impossible journey home."}
             </div>
-            {level > 0 && (
+            {mode === "story" && level > 0 && (
               <div style={{ fontSize: "11px", opacity: 0.7, marginBottom: "14px" }}>
                 resume at <span style={{ color: realm.accent, fontWeight: "bold" }}>LV {level + 1}</span> · {realm.name}
               </div>
             )}
+            {mode === "ngplus" && ngPlusLevel > 0 && (
+              <div style={{ fontSize: "11px", opacity: 0.7, marginBottom: "14px" }}>
+                NG+ resume at <span style={{ color: realm.accent, fontWeight: "bold" }}>LV {ngPlusLevel + 1}</span>
+              </div>
+            )}
             <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", justifyContent: "center" }}>
-              <Btn realm={realm} onClick={() => startLevel(level)}>◉ {level > 0 ? "CONTINUE" : "BEGIN"}</Btn>
+              <Btn realm={realm} onClick={() => startLevel(mode === "ngplus" ? ngPlusLevel : level)}>
+                ◉ {(mode === "story" ? level : ngPlusLevel) > 0 ? "CONTINUE" : "BEGIN"}
+              </Btn>
+              {(ngPlusUnlocked || endlessUnlocked) && (
+                <Btn realm={realm} onClick={() => setShowModeSelect(true)} ghost>⤢ MODE</Btn>
+              )}
               <Btn realm={realm} onClick={() => setShowTypes(true)} ghost>? TYPES</Btn>
-              {level > 0 && <Btn realm={realm} onClick={restartGame} ghost>⟲ RESTART</Btn>}
+              {(level > 0 || ngPlusLevel > 0) && <Btn realm={realm} onClick={restartGame} ghost>⟲ RESET</Btn>}
             </div>
+          </Overlay>
+        )}
+
+        {/* MODE SELECT */}
+        {showModeSelect && (
+          <Overlay realm={realm}>
+            <div style={{ fontSize: "10px", letterSpacing: "5px", opacity: 0.6, marginBottom: "14px" }}>
+              SELECT MODE
+            </div>
+            <div style={{ display: "flex", flexDirection: "column", gap: "12px", maxWidth: "360px", width: "100%", marginBottom: "16px" }}>
+              <ModeCard
+                realm={realm}
+                active={mode === "story"}
+                title="STORY"
+                subtitle="1000 levels · 10 realms"
+                progress={level > 0 ? `LV ${level + 1} / 1000` : "begin the journey"}
+                onClick={() => enterMode("story")}
+              />
+              <ModeCard
+                realm={realm}
+                active={mode === "ngplus"}
+                title="★ NEW GAME +"
+                subtitle="harder · faster · meaner"
+                progress={ngPlusUnlocked
+                  ? (ngPlusLevel > 0 ? `NG+ LV ${ngPlusLevel + 1} / 1000` : "ready to begin")
+                  : "locked — finish story first"}
+                locked={!ngPlusUnlocked}
+                onClick={() => ngPlusUnlocked && enterMode("ngplus")}
+              />
+              <ModeCard
+                realm={realm}
+                active={mode === "endless"}
+                title="∞ ENDLESS"
+                subtitle="one life · scaling forever"
+                progress={endlessUnlocked
+                  ? (endlessBest > 0 ? `best wave: ${endlessBest}` : "ready to begin")
+                  : "locked — finish story first"}
+                locked={!endlessUnlocked}
+                onClick={() => endlessUnlocked && enterMode("endless")}
+              />
+            </div>
+            <Btn realm={realm} onClick={() => setShowModeSelect(false)} ghost>◀ BACK</Btn>
           </Overlay>
         )}
 
@@ -741,7 +980,9 @@ export default function BubbleChain() {
         {gameState === "done" && (
           <Overlay realm={realm}>
             <div style={{ fontSize: "10px", letterSpacing: "5px", opacity: 0.6, marginBottom: "8px" }}>
-              {passed ? `${levelCfg.boss ? "BOSS DEFEATED" : "LEVEL CLEARED"}` : "CHAIN BROKEN"}
+              {passed
+                ? (mode === "endless" ? "WAVE CLEARED" : levelCfg.boss ? "BOSS DEFEATED" : "LEVEL CLEARED")
+                : (mode === "endless" ? "RUN ENDED" : "CHAIN BROKEN")}
             </div>
             <div style={{
               fontSize: "52px", fontWeight: "bold", letterSpacing: "2px", marginBottom: "4px", lineHeight: 1,
@@ -755,44 +996,79 @@ export default function BubbleChain() {
                 ? (score === total ? "⟡ PERFECT ⟡" :
                    score >= total * 0.9 ? "outstanding." :
                    score >= total * 0.75 ? "impressive." : "onward.")
-                : `needed ${passThreshold}. restart round ${Math.floor(levelCfg.roundStart / 10) + 1}.`}
+                : (mode === "endless"
+                  ? `reached wave ${endlessWave}. needed ${passThreshold}.`
+                  : `needed ${passThreshold}. restart from LV ${levelCfg.roundStart}.`)}
             </div>
             <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", justifyContent: "center" }}>
               {passed ? (
                 <Btn realm={realm} onClick={nextLevel}>
-                  {level + 1 >= 1000 ? "★ ASCEND" : `▸ LV ${level + 2}`}
+                  {mode === "endless"
+                    ? `▸ WAVE ${endlessWave + 1}`
+                    : (mode === "ngplus" ? ngPlusLevel : level) + 1 >= 1000
+                      ? "★ ASCEND"
+                      : `▸ LV ${(mode === "ngplus" ? ngPlusLevel : level) + 2}`}
                 </Btn>
               ) : (
-                <Btn realm={realm} onClick={retryRound}>↻ LV {levelCfg.roundStart}</Btn>
+                <Btn realm={realm} onClick={retryRound}>
+                  {mode === "endless" ? "↻ NEW RUN" : `↻ LV ${levelCfg.roundStart}`}
+                </Btn>
               )}
-              <Btn realm={realm} onClick={() => startLevel(level)} ghost>↺ THIS LV</Btn>
+              {mode !== "endless" && (
+                <Btn realm={realm} onClick={retrySame} ghost>↺ THIS LV</Btn>
+              )}
             </div>
           </Overlay>
         )}
 
-        {/* GAME OVER (1000 cleared) */}
+        {/* GAME OVER */}
         {gameState === "gameover" && (
           <Overlay realm={realm}>
             <div style={{ fontSize: "10px", letterSpacing: "5px", opacity: 0.6, marginBottom: "12px" }}>
-              THE JOURNEY ENDS
+              {mode === "ngplus" ? "THE TRUE ENDING" : "THE JOURNEY ENDS"}
             </div>
             <div style={{
               fontSize: "42px", fontWeight: "bold", letterSpacing: "3px", marginBottom: "8px",
               textShadow: `0 0 25px ${realm.accent}, 0 0 60px ${realm.accent}`,
               color: realm.accent, lineHeight: 1,
             }}>
-              YOU MADE IT<br/>HOME
+              {mode === "ngplus" ? <>MASTER<br/>OF CHAINS</> : <>YOU MADE IT<br/>HOME</>}
             </div>
             <div style={{ fontSize: "12px", opacity: 0.75, maxWidth: "340px", textAlign: "center", lineHeight: 1.6, marginBottom: "20px", fontStyle: "italic" }}>
-              A thousand chains across ten realms. The pilot lands, finally, where they started.
+              {mode === "ngplus"
+                ? "Two journeys. A thousand realms each. There is nothing left to prove."
+                : "A thousand chains across ten realms. The pilot lands, finally, where they started."}
             </div>
+            {mode === "story" && (
+              <div style={{
+                fontSize: "11px", opacity: 0.9, marginBottom: "16px", padding: "8px 16px",
+                border: `1px solid ${realm.secondaryAccent}`,
+                color: realm.secondaryAccent,
+                textShadow: `0 0 10px ${realm.secondaryAccent}`,
+                letterSpacing: "2px",
+              }}>
+                ★ NEW GAME + AND ∞ ENDLESS UNLOCKED ★
+              </div>
+            )}
             <div style={{ fontSize: "14px", opacity: 0.8, marginBottom: "4px" }}>
-              final total: <span style={{ fontWeight: "bold", color: "#fff" }}>{totalScore}</span>
+              total: <span style={{ fontWeight: "bold", color: "#fff" }}>{totalScore}</span>
             </div>
             <div style={{ fontSize: "12px", opacity: 0.6, marginBottom: "22px" }}>
               best single chain: {best}
             </div>
-            <Btn realm={realm} onClick={restartGame}>⟲ AGAIN</Btn>
+            <div style={{ display: "flex", gap: "10px", flexWrap: "wrap", justifyContent: "center" }}>
+              {mode === "story" ? (
+                <>
+                  <Btn realm={realm} onClick={() => setShowModeSelect(true)}>⤢ NEW MODES</Btn>
+                  <Btn realm={realm} onClick={restartGame} ghost>⟲ AGAIN</Btn>
+                </>
+              ) : (
+                <>
+                  <Btn realm={realm} onClick={() => setShowModeSelect(true)}>⤢ MODE</Btn>
+                  <Btn realm={realm} onClick={restartGame} ghost>⟲ RESET ALL</Btn>
+                </>
+              )}
+            </div>
           </Overlay>
         )}
 
@@ -1032,4 +1308,36 @@ function hexToRgb(hex) {
   const g = (bigint >> 8) & 255;
   const b = bigint & 255;
   return `${r}, ${g}, ${b}`;
+}
+
+function ModeCard({ realm, active, title, subtitle, progress, locked, onClick }) {
+  const [hover, setHover] = useState(false);
+  return (
+    <button
+      onClick={onClick}
+      onMouseEnter={() => setHover(true)}
+      onMouseLeave={() => setHover(false)}
+      disabled={locked}
+      style={{
+        background: active ? `rgba(${hexToRgb(realm.accent)}, 0.15)` : (hover && !locked ? `rgba(${hexToRgb(realm.accent)}, 0.08)` : "transparent"),
+        border: `1px solid ${active ? realm.accent : `rgba(${hexToRgb(realm.accent)}, ${locked ? 0.15 : 0.3})`}`,
+        color: locked ? `rgba(${hexToRgb(realm.accent)}, 0.4)` : realm.accent,
+        padding: "12px 16px",
+        textAlign: "left",
+        cursor: locked ? "not-allowed" : "pointer",
+        fontFamily: realm.font,
+        transition: "all 0.15s ease",
+        boxShadow: active ? `0 0 20px rgba(${hexToRgb(realm.accent)}, 0.3)` : "none",
+        opacity: locked ? 0.5 : 1,
+      }}
+    >
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+        <div style={{ fontSize: "14px", fontWeight: "bold", letterSpacing: "3px" }}>{title}</div>
+        {active && <div style={{ fontSize: "9px", letterSpacing: "2px", opacity: 0.8 }}>● ACTIVE</div>}
+        {locked && <div style={{ fontSize: "9px", letterSpacing: "2px", opacity: 0.6 }}>🔒</div>}
+      </div>
+      <div style={{ fontSize: "10px", opacity: 0.65, letterSpacing: "1px", marginTop: 3 }}>{subtitle}</div>
+      <div style={{ fontSize: "10px", opacity: 0.85, letterSpacing: "1px", marginTop: 6, color: realm.secondaryAccent }}>{progress}</div>
+    </button>
+  );
 }
